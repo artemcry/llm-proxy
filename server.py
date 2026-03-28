@@ -203,19 +203,28 @@ async def forward_to_minimax(body: dict) -> dict:
 
 async def stream_from_minimax(body: dict):
     body = {**body, "model": MINIMAX_MODEL, "stream": True}
-    async with http_client.stream(
-        "POST", MINIMAX_URL,
-        headers={"Authorization": f"Bearer {MINIMAX_KEY}"},
-        json=body
-    ) as resp:
-        if resp.status_code != 200:
-            error_body = await resp.aread()
-            logger.error(f"  MiniMax stream error: {resp.status_code} {error_body[:200]}")
-            yield f"data: {json.dumps({'error': {'message': f'MiniMax error {resp.status_code}', 'code': resp.status_code}})}\n\n".encode()
-            yield b"data: [DONE]\n\n"
-            return
-        async for chunk in resp.aiter_bytes():
-            yield chunk
+    try:
+        async with http_client.stream(
+            "POST", MINIMAX_URL,
+            headers={"Authorization": f"Bearer {MINIMAX_KEY}"},
+            json=body
+        ) as resp:
+            if resp.status_code != 200:
+                error_body = await resp.aread()
+                logger.error(f"  MiniMax stream error: {resp.status_code} {error_body[:200]}")
+                yield f"data: {json.dumps({'error': {'message': f'MiniMax error {resp.status_code}', 'code': resp.status_code}})}\n\n".encode()
+                yield b"data: [DONE]\n\n"
+                return
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+    except httpx.ReadTimeout:
+        logger.error("  MiniMax stream ReadTimeout")
+        yield f"data: {json.dumps({'error': {'message': 'MiniMax read timeout', 'code': 504}})}\n\n".encode()
+        yield b"data: [DONE]\n\n"
+    except httpx.HTTPError as e:
+        logger.error(f"  MiniMax stream error: {e}")
+        yield f"data: {json.dumps({'error': {'message': str(e), 'code': 502}})}\n\n".encode()
+        yield b"data: [DONE]\n\n"
 
 
 QUOTA_ERROR_MSG = (
