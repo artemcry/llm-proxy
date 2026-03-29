@@ -17,36 +17,28 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from google import genai
 from google.genai import types
 
-# Setup logger - will be configured by server_bg.py or use defaults
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
-    datefmt='%H:%M:%S'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', datefmt='%H:%M:%S')
 logger = logging.getLogger("llmproxy")
 
 load_dotenv()
 
 MINIMAX_KEY = os.environ.get("MINIMAX_API_KEY")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_KEY  = os.environ.get("GEMINI_API_KEY")
 
-if not MINIMAX_KEY:
-    sys.exit("ERROR: MINIMAX_API_KEY not found in .env")
-if not GEMINI_KEY:
-    sys.exit("ERROR: GEMINI_API_KEY not found in .env")
+if not MINIMAX_KEY: sys.exit("ERROR: MINIMAX_API_KEY not found in .env")
+if not GEMINI_KEY:  sys.exit("ERROR: GEMINI_API_KEY not found in .env")
 
 gemini_client = genai.Client(api_key=GEMINI_KEY)
 
-SERVER_HOST = os.environ.get("SERVER_HOST", "127.0.0.1")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8087"))
-
-MINIMAX_URL = os.environ.get("MINIMAX_URL", "https://api.minimax.io/v1/chat/completions")
-MINIMAX_MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
-IMAGE_CACHE_MAX = int(os.environ.get("IMAGE_CACHE_MAX", "256"))
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+SERVER_HOST          = os.environ.get("SERVER_HOST", "127.0.0.1")
+SERVER_PORT          = int(os.environ.get("SERVER_PORT", "8087"))
+MINIMAX_ANTHROPIC_URL = os.environ.get("MINIMAX_ANTHROPIC_URL", "https://api.minimax.io/anthropic")
+MINIMAX_MODEL        = os.environ.get("MINIMAX_MODEL", "MiniMax-M2.7")
+IMAGE_CACHE_MAX      = int(os.environ.get("IMAGE_CACHE_MAX", "256"))
+GEMINI_MODEL         = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+ANTHROPIC_API_URL    = os.environ.get("ANTHROPIC_API_URL", "https://api.anthropic.com")
 
 _image_cache: OrderedDict[str, str] = OrderedDict()
-
 http_client: httpx.AsyncClient = None
 
 
@@ -57,53 +49,41 @@ async def lifespan(_app: FastAPI):
     yield
     await http_client.aclose()
 
-
 app = FastAPI(lifespan=lifespan)
+
+
+def is_minimax_model(model: str) -> bool:
+    """Check if the requested model should be routed to MiniMax."""
+    return model.lower().startswith("minimax")
 
 
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
-    return {
-        "object": "list",
-        "data": [{"id": MINIMAX_MODEL, "object": "model"}]
-    }
+    return {"object": "list", "data": [{"id": MINIMAX_MODEL, "object": "model"}]}
 
+
+# ── Image helpers ─────────────────────────────────────────────────────────────
 
 def has_images(messages: list) -> bool:
     for msg in messages:
         content = msg.get("content", "")
         if isinstance(content, list):
             for part in content:
-                if isinstance(part, dict) and part.get("type") in ("image_url", "image"):
+                if isinstance(part, dict) and part.get("type") == "image":
                     return True
     return False
 
 
-def last_message_preview(messages: list) -> str:
-    if not messages:
-        return ""
-    content = messages[-1].get("content", "")
-    if isinstance(content, list):
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                return part.get("text", "")[:150]
-        return str(content)[:150]
-    return str(content)[:150]
-
-
-async def extract_image_bytes(image_url_value: dict) -> tuple[bytes, str]:
-    url = image_url_value.get("url", "")
-    if url.startswith("data:"):
-        header, b64data = url.split(",", 1)
-        mime_type = header.split(";")[0].replace("data:", "")
-        return base64.b64decode(b64data), mime_type
-    if url.startswith(("http://", "https://")):
-        resp = await http_client.get(url)
+async def extract_image_bytes(source: dict) -> tuple[bytes, str]:
+    src_type = source.get("type")
+    if src_type == "base64":
+        return base64.b64decode(source.get("data", "")), source.get("media_type", "image/png")
+    if src_type == "url":
+        resp = await http_client.get(source.get("url", ""))
         resp.raise_for_status()
-        mime_type = resp.headers.get("content-type", "image/png").split(";")[0]
-        return resp.content, mime_type
-    raise ValueError(f"Unsupported image URL: {url[:60]}")
+        return resp.content, resp.headers.get("content-type", "image/png").split(";")[0]
+    raise ValueError(f"Unsupported image source type: {src_type}")
 
 
 async def describe_image(image_bytes: bytes, mime_type: str) -> str:
@@ -122,11 +102,9 @@ async def describe_image(image_bytes: bytes, mime_type: str) -> str:
             "If it contains code, UI, error messages, or terminal output — "
             "reproduce the text content exactly, then describe the layout."
         ],
-        config=types.GenerateContentConfig()
     )
     description = response.text
     logger.info(f"    Gemini -> {len(description)} chars")
-
     _image_cache[key] = description
     if len(_image_cache) > IMAGE_CACHE_MAX:
         _image_cache.popitem(last=False)
@@ -134,7 +112,7 @@ async def describe_image(image_bytes: bytes, mime_type: str) -> str:
 
 
 async def replace_images(messages: list) -> tuple[list, bool]:
-    """Replace image parts with Gemini descriptions (parallel). Flattens content to string."""
+    """Replace Anthropic image blocks with Gemini text. Keep all other blocks intact."""
     image_tasks = []
     msg_structures = []
 
@@ -143,22 +121,17 @@ async def replace_images(messages: list) -> tuple[list, bool]:
         if not isinstance(content, list):
             msg_structures.append((msg, None))
             continue
-
         parts_info = []
         for part in content:
-            if not isinstance(part, dict):
-                parts_info.append(("lit", str(part)))
-            elif part.get("type") == "image_url":
+            if isinstance(part, dict) and part.get("type") == "image":
                 try:
-                    img_bytes, mime_type = await extract_image_bytes(part["image_url"])
+                    img_bytes, mime_type = await extract_image_bytes(part.get("source", {}))
                     parts_info.append(("img", len(image_tasks)))
                     image_tasks.append(describe_image(img_bytes, mime_type))
-                except (ValueError, httpx.HTTPError) as e:
-                    parts_info.append(("lit", f"[Image error: {e}]"))
-            elif part.get("type") == "text":
-                parts_info.append(("lit", part.get("text", "")))
+                except Exception as e:
+                    parts_info.append(("text", f"[Image error: {e}]"))
             else:
-                parts_info.append(("lit", str(part)))
+                parts_info.append(("keep", part))
         msg_structures.append((msg, parts_info))
 
     results = await asyncio.gather(*image_tasks, return_exceptions=True) if image_tasks else []
@@ -169,62 +142,30 @@ async def replace_images(messages: list) -> tuple[list, bool]:
         if parts_info is None:
             new_messages.append(msg)
             continue
-
-        text_parts = []
+        new_parts = []
         for kind, value in parts_info:
-            if kind == "lit":
-                text_parts.append(value)
+            if kind == "keep":
+                new_parts.append(value)
+            elif kind == "text":
+                new_parts.append({"type": "text", "text": value})
             elif kind == "img":
                 result = results[value]
                 if isinstance(result, Exception):
-                    err = str(result)
-                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                    if "429" in str(result) or "RESOURCE_EXHAUSTED" in str(result):
                         quota_exceeded = True
-                    logger.info(f"    Image error: {result}")
-                    text_parts.append(f"[Image could not be described: {result}]")
+                    new_parts.append({"type": "text", "text": f"[Image could not be described: {result}]"})
                 else:
-                    text_parts.append(f"[Image description by Gemini Vision]:\n{result}")
+                    new_parts.append({
+                    "type": "text",
+                    "text": f"<image>\n{result}\n</image>"
+                })
+        # Simplify to plain string if only one text block
+        if len(new_parts) == 1 and new_parts[0].get("type") == "text":
+            new_messages.append({**msg, "content": new_parts[0]["text"]})
+        else:
+            new_messages.append({**msg, "content": new_parts})
 
-        new_messages.append({**msg, "content": "\n\n".join(text_parts)})
     return new_messages, quota_exceeded
-
-
-async def forward_to_minimax(body: dict) -> dict:
-    body = {**body, "model": MINIMAX_MODEL, "stream": False}
-    resp = await http_client.post(
-        MINIMAX_URL,
-        headers={"Authorization": f"Bearer {MINIMAX_KEY}"},
-        json=body
-    )
-    logger.info(f"  MiniMax {resp.status_code} ({len(resp.content)}B)")
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def stream_from_minimax(body: dict):
-    body = {**body, "model": MINIMAX_MODEL, "stream": True}
-    try:
-        async with http_client.stream(
-            "POST", MINIMAX_URL,
-            headers={"Authorization": f"Bearer {MINIMAX_KEY}"},
-            json=body
-        ) as resp:
-            if resp.status_code != 200:
-                error_body = await resp.aread()
-                logger.error(f"  MiniMax stream error: {resp.status_code} {error_body[:200]}")
-                yield f"data: {json.dumps({'error': {'message': f'MiniMax error {resp.status_code}', 'code': resp.status_code}})}\n\n".encode()
-                yield b"data: [DONE]\n\n"
-                return
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-    except httpx.ReadTimeout:
-        logger.error("  MiniMax stream ReadTimeout")
-        yield f"data: {json.dumps({'error': {'message': 'MiniMax read timeout', 'code': 504}})}\n\n".encode()
-        yield b"data: [DONE]\n\n"
-    except httpx.HTTPError as e:
-        logger.error(f"  MiniMax stream error: {e}")
-        yield f"data: {json.dumps({'error': {'message': str(e), 'code': 502}})}\n\n".encode()
-        yield b"data: [DONE]\n\n"
 
 
 QUOTA_ERROR_MSG = (
@@ -233,68 +174,141 @@ QUOTA_ERROR_MSG = (
 )
 
 
-@app.post("/v1/chat/completions")
-@app.post("/chat/completions")
-async def chat_completions(request: Request):
-    body = await request.json()
-    messages = body.get("messages", [])
-    images = has_images(messages)
-    stream = body.get("stream", False)
+# ── Anthropic passthrough (for Claude models) ────────────────────────────────
 
-    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    tools = body.get("tools", [])
-    tool_names = ", ".join(t.get("function", {}).get("name", "?") for t in tools[:5]) if tools else "-"
-    logger.info(f"\n[{ts}] {body.get('model','?')} | msgs={len(messages)} img={'Y' if images else 'N'} "
-          f"stream={'Y' if stream else 'N'} tools={tool_names}")
+async def proxy_to_anthropic(request: Request, body: dict, stream: bool):
+    """Forward request directly to Anthropic API, using the auth token from the original request."""
+    target = f"{ANTHROPIC_API_URL.rstrip('/')}/v1/messages"
 
-    if images:
-        logger.info("  Describing images...")
-        messages, quota_exceeded = await replace_images(messages)
-        if quota_exceeded:
-            logger.warning("  Quota exceeded!")
-            if stream:
-                chunk_response = {
-                    "id": "quota_error",
-                    "object": "chat.completion.chunk",
-                    "choices": [{"index": 0, "delta": {"role": "assistant", "content": QUOTA_ERROR_MSG}, "finish_reason": "stop"}],
-                }
-                async def _qs():
-                    yield f"data: {json.dumps(chunk_response)}\n\n"
-                    yield "data: [DONE]\n\n"
-                return StreamingResponse(_qs(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
-            error_response = {
-                "id": "quota_error",
-                "object": "chat.completion",
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": QUOTA_ERROR_MSG}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            }
-            return JSONResponse(error_response)
-        body["messages"] = messages
+    # Extract API key: Claude Code sends "Authorization: Bearer sk-..." but
+    # Anthropic API expects "x-api-key: sk-..." header
+    api_key = request.headers.get("x-api-key", "")
+    if not api_key:
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            api_key = auth_header[7:].strip()
+
+    headers = {
+        "Content-Type": "application/json",
+        "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
+    }
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    # Forward any other anthropic-* headers
+    for key, value in request.headers.items():
+        if key.lower().startswith("anthropic-") and key.lower() not in headers:
+            headers[key] = value
+
+    model = body.get("model", "?")
+    logger.info(f"  -> Anthropic API ({model})")
 
     if stream:
         return StreamingResponse(
-            stream_from_minimax(body),
+            _forward_stream(target, headers, body),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
 
     try:
-        result = await forward_to_minimax(body)
-        choice = result.get("choices", [{}])[0]
-        msg = choice.get("message", {})
-        reply = msg.get("content", "") or ""
-        tc = msg.get("tool_calls")
-        logger.info(f"  < {choice.get('finish_reason')} | tc={'Y' if tc else 'N'} | {len(reply)}ch")
-        if tc and msg.get("content"):
-            msg["content"] = None
-        return JSONResponse(result)
+        resp = await http_client.post(target, headers=headers, json=body)
+        logger.info(f"  Anthropic {resp.status_code} ({len(resp.content)}B)")
+        # Pass through the raw response (including errors) so Claude Code sees real messages
+        return JSONResponse(resp.json(), status_code=resp.status_code)
+    except Exception as e:
+        logger.error(f"  Anthropic ERROR: {e}")
+        return JSONResponse(
+            {"type": "error", "error": {"type": "api_error", "message": str(e)}},
+            status_code=502,
+        )
 
+
+# ── Proxy endpoint ────────────────────────────────────────────────────────────
+
+@app.post("/v1/messages")
+@app.post("/messages")
+async def proxy_messages(request: Request):
+    body = await request.json()
+    model = body.get("model", "")
+    messages = body.get("messages", [])
+    images = has_images(messages)
+    stream = body.get("stream", False)
+
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    logger.info(f"\n[{ts}] {model} | msgs={len(messages)} img={'Y' if images else 'N'} stream={'Y' if stream else 'N'}")
+
+    # ── Route: non-MiniMax models go straight to Anthropic ──
+    if not is_minimax_model(model):
+        return await proxy_to_anthropic(request, body, stream)
+
+    # ── Route: MiniMax — handle images via Gemini, then forward ──
+    if images:
+        logger.info("  Describing images via Gemini...")
+        messages, quota_exceeded = await replace_images(messages)
+        if quota_exceeded:
+            return _quota_error(stream)
+        body = {**body, "messages": messages}
+
+    body = {**body, "model": MINIMAX_MODEL}
+    target = f"{MINIMAX_ANTHROPIC_URL.rstrip('/')}/v1/messages"
+    headers = {
+        "Authorization": f"Bearer {MINIMAX_KEY}",
+        "Content-Type": "application/json",
+        "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
+    }
+
+    if stream:
+        return StreamingResponse(
+            _forward_stream(target, headers, body),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    try:
+        resp = await http_client.post(target, headers=headers, json=body)
+        logger.info(f"  MiniMax {resp.status_code} ({len(resp.content)}B)")
+        return JSONResponse(resp.json(), status_code=resp.status_code)
     except httpx.HTTPStatusError as e:
-        logger.error(f"  ERROR: MiniMax {e.response.status_code}: {e.response.text[:200]}")
-        return JSONResponse({"error": str(e)}, status_code=502)
+        logger.error(f"  MiniMax {e.response.status_code}: {e.response.text[:200]}")
+        return JSONResponse(e.response.json(), status_code=e.response.status_code)
     except Exception as e:
         logger.error(f"  ERROR: {e}")
-        return JSONResponse({"error": str(e)}, status_code=502)
+        return JSONResponse({"type": "error", "error": {"type": "api_error", "message": str(e)}}, status_code=502)
+
+
+async def _forward_stream(url: str, headers: dict, body: dict):
+    try:
+        async with http_client.stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code != 200:
+                err = await resp.aread()
+                logger.error(f"  Stream error {resp.status_code}: {err[:200]}")
+                yield f"data: {json.dumps({'type':'error','error':{'type':'api_error','message':f'Upstream {resp.status_code}'}})}\n\n".encode()
+                return
+            async for chunk in resp.aiter_bytes():
+                yield chunk
+    except httpx.ReadTimeout:
+        logger.error("  Stream timeout")
+        yield f"data: {json.dumps({'type':'error','error':{'type':'api_error','message':'timeout'}})}\n\n".encode()
+    except httpx.HTTPError as e:
+        logger.error(f"  Stream HTTP error: {e}")
+        yield f"data: {json.dumps({'type':'error','error':{'type':'api_error','message':str(e)}})}\n\n".encode()
+
+
+def _quota_error(stream: bool):
+    if stream:
+        async def _qs():
+            yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':{'id':'msg_quota','type':'message','role':'assistant','model':MINIMAX_MODEL,'content':[],'stop_reason':None,'usage':{'input_tokens':0,'output_tokens':0}}})}\n\n"
+            yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
+            yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':QUOTA_ERROR_MSG}})}\n\n"
+            yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+            yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn'},'usage':{'output_tokens':0}})}\n\n"
+            yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+        return StreamingResponse(_qs(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+    return JSONResponse({
+        "id": "msg_quota", "type": "message", "role": "assistant", "model": MINIMAX_MODEL,
+        "content": [{"type": "text", "text": QUOTA_ERROR_MSG}],
+        "stop_reason": "end_turn", "usage": {"input_tokens": 0, "output_tokens": 0}
+    })
 
 
 if __name__ == "__main__":
