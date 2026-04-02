@@ -123,7 +123,9 @@ def sanitize_body_for_minimax(body: dict, original_model: str) -> dict:
                 sys_text = sys_text.replace(pattern, MINIMAX_MODEL)
         clean["system"] = sys_text
 
-    # ── Remove cache_control from message content parts ──
+    # ── Remove thinking blocks and cache_control from message content parts ──
+    # thinking blocks carry Anthropic-specific signatures that MiniMax doesn't
+    # understand — sending them causes 400 errors or silent corruption.
     messages = clean.get("messages", [])
     cleaned_messages = []
     for msg in messages:
@@ -132,9 +134,20 @@ def sanitize_body_for_minimax(body: dict, original_model: str) -> dict:
         if isinstance(content, list):
             new_content = []
             for part in content:
-                if isinstance(part, dict) and "cache_control" in part:
+                if not isinstance(part, dict):
+                    new_content.append(part)
+                    continue
+                # Drop thinking blocks entirely — MiniMax rejects them
+                if part.get("type") == "thinking":
+                    logger.info("    Dropped thinking block from message history")
+                    continue
+                # Strip cache_control
+                if "cache_control" in part:
                     part = {k: v for k, v in part.items() if k != "cache_control"}
                 new_content.append(part)
+            # Avoid sending an assistant message with empty content
+            if not new_content:
+                new_content = [{"type": "text", "text": ""}]
             msg["content"] = new_content
         cleaned_messages.append(msg)
     clean["messages"] = cleaned_messages
@@ -403,10 +416,38 @@ async def replace_images_openai(messages: list) -> tuple[list, bool]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _forward_stream(url: str, headers: dict, body: dict):
-    """Forward an Anthropic-format stream."""
+    """Forward an Anthropic-format stream (MiniMax path — body is a dict)."""
     first_chunk = True
     try:
         async with http_client.stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code != 200:
+                err = await resp.aread()
+                logger.error(f"  Stream error {resp.status_code}: {err[:300]}")
+                err_msg = f"Upstream {resp.status_code}: {err[:100].decode(errors='replace')}"
+                yield f"data: {json.dumps({'type':'error','error':{'type':'api_error','message':err_msg}})}\n\n".encode()
+                return
+            async for chunk in resp.aiter_bytes():
+                if first_chunk:
+                    logger.info(f"  Stream first chunk: {len(chunk)}B — {chunk[:120]}")
+                    first_chunk = False
+                yield chunk
+    except httpx.ReadTimeout:
+        logger.error("  Stream timeout")
+        yield f"data: {json.dumps({'type':'error','error':{'type':'api_error','message':'timeout'}})}\n\n".encode()
+    except httpx.HTTPError as e:
+        logger.error(f"  Stream HTTP error: {e}")
+        yield f"data: {json.dumps({'type':'error','error':{'type':'api_error','message':str(e)}})}\n\n".encode()
+
+
+async def _forward_stream_raw(url: str, headers: dict, raw_body: bytes):
+    """Forward an Anthropic-format stream using raw bytes (Anthropic passthrough).
+
+    Uses content= instead of json= so thinking block signatures are never
+    re-serialized and cannot be corrupted.
+    """
+    first_chunk = True
+    try:
+        async with http_client.stream("POST", url, headers=headers, content=raw_body) as resp:
             if resp.status_code != 200:
                 err = await resp.aread()
                 logger.error(f"  Stream error {resp.status_code}: {err[:300]}")
@@ -460,39 +501,52 @@ async def _stream_openai(body: dict):
 #  Anthropic passthrough (for real Claude models — sonnet/opus etc.)
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def proxy_to_anthropic(request: Request, body: dict, stream: bool):
-    """Forward request directly to Anthropic API."""
+async def proxy_to_anthropic(request: Request, raw_body: bytes, stream: bool):
+    """Forward request directly to Anthropic API using original raw bytes.
+
+    Critically, we do NOT re-serialize the body — passing raw bytes preserves
+    thinking block signatures exactly as Claude Code sent them, preventing
+    'Invalid signature in thinking block' 400 errors on multi-turn conversations.
+    """
     target = f"{ANTHROPIC_API_URL.rstrip('/')}/v1/messages"
 
     api_key = request.headers.get("x-api-key", "")
-    if not api_key:
-        auth_header = request.headers.get("authorization", "")
-        if auth_header.lower().startswith("bearer "):
-            api_key = auth_header[7:].strip()
+    auth_header = request.headers.get("authorization", "")
+    is_oauth = auth_header.lower().startswith("bearer ")
 
     headers = {
         "Content-Type": "application/json",
         "anthropic-version": request.headers.get("anthropic-version", "2023-06-01"),
     }
-    if api_key:
+
+    if is_oauth:
+        # OAuth: forward Authorization: Bearer <token> as-is
+        headers["authorization"] = auth_header
+        logger.info("  Auth: OAuth Bearer token")
+    elif api_key:
+        # API key: use x-api-key header
         headers["x-api-key"] = api_key
+        logger.info("  Auth: x-api-key")
+    else:
+        logger.warning("  Auth: no credentials found in request!")
 
     for key, value in request.headers.items():
         if key.lower().startswith("anthropic-") and key.lower() not in headers:
             headers[key] = value
 
-    model = body.get("model", "?")
+    body_preview = json.loads(raw_body)
+    model = body_preview.get("model", "?")
     logger.info(f"  -> Anthropic API ({model})")
 
     if stream:
         return StreamingResponse(
-            _forward_stream(target, headers, body),
+            _forward_stream_raw(target, headers, raw_body),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
 
     try:
-        resp = await http_client.post(target, headers=headers, json=body)
+        resp = await http_client.post(target, headers=headers, content=raw_body)
         logger.info(f"  Anthropic {resp.status_code} ({len(resp.content)}B)")
         return JSONResponse(resp.json(), status_code=resp.status_code)
     except Exception as e:
@@ -548,7 +602,8 @@ def _quota_error_openai(stream: bool):
 @app.post("/v1/messages")
 @app.post("/messages")
 async def proxy_messages(request: Request):
-    body = await request.json()
+    raw_body = await request.body()          # keep original bytes for Anthropic passthrough
+    body = json.loads(raw_body)              # parse for routing logic
     model = body.get("model", "")
     messages = body.get("messages", [])
     images = has_images_anthropic(messages)
@@ -571,7 +626,7 @@ async def proxy_messages(request: Request):
 
     # ── Route: real Claude models go straight to Anthropic ──
     if not route_minimax:
-        return await proxy_to_anthropic(request, body, stream)
+        return await proxy_to_anthropic(request, raw_body, stream)
 
     # ── Route: MiniMax (explicit or intercepted haiku etc.) ──
     logger.info(f"    Intercepted '{model}' -> {MINIMAX_MODEL}")
