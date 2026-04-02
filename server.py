@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import logging
+import threading
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -51,6 +52,10 @@ INTERCEPT_MODELS = [s.strip().lower() for s in os.environ.get("INTERCEPT_MODELS"
 _image_cache: OrderedDict[str, str] = OrderedDict()
 http_client: httpx.AsyncClient = None
 
+_counter_lock = threading.Lock()
+LOGS_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+COUNTER_FILE = os.path.join(LOGS_DIR, "counter.json")
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -64,9 +69,7 @@ app = FastAPI(lifespan=lifespan)
 
 def should_route_to_minimax(model: str) -> bool:
     """Check if the requested model should be routed to MiniMax."""
-    m = model.lower()
-    logger.info("MODEL", m)
-    logger.info("MODEL CHECK", m.startswith("minimax"))
+    m = model.lower()  
     if m.startswith("minimax"):
         return True
     for pattern in INTERCEPT_MODELS:
@@ -498,6 +501,100 @@ async def _stream_openai(body: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  Token counter
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _minimax_key(original_model: str) -> str:
+    """Return counter key: direct MiniMax or intercepted."""
+    if original_model.lower().startswith("minimax"):
+        return MINIMAX_MODEL
+    return f"{MINIMAX_MODEL} (intercepted)"
+
+
+def _update_counter(model_key: str, input_tokens: int, output_tokens: int) -> None:
+    """Append input/output tokens to monthly counter in logs/counter.txt."""
+    if not input_tokens and not output_tokens:
+        return
+    month = datetime.now().strftime("%Y-%m")
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        with _counter_lock:
+            data: dict = {}
+            if os.path.exists(COUNTER_FILE):
+                try:
+                    with open(COUNTER_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    data = {}
+            month_data = data.setdefault(month, {})
+
+            def _inc(key: str) -> None:
+                e = month_data.setdefault(key, {"input": 0, "output": 0, "requests": 0})
+                e["input"]    += input_tokens
+                e["output"]   += output_tokens
+                e["requests"] += 1
+
+            _inc(model_key)
+            if model_key in (MINIMAX_MODEL, f"{MINIMAX_MODEL} (intercepted)"):
+                _inc(f"{MINIMAX_MODEL} (total)")
+
+            with open(COUNTER_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"  Counter write failed: {e}")
+
+
+async def _count_stream_anthropic(gen, model_key: str):
+    """Wrap Anthropic SSE stream; count tokens from message_start/message_delta."""
+    input_tokens = output_tokens = 0
+    try:
+        async for chunk in gen:
+            yield chunk
+            try:
+                for line in chunk.decode("utf-8", errors="replace").split("\n"):
+                    if not line.startswith("data: "):
+                        continue
+                    raw = line[6:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    evt = json.loads(raw)
+                    t = evt.get("type")
+                    if t == "message_start":
+                        usage = evt.get("message", {}).get("usage", {})
+                        input_tokens += usage.get("input_tokens", 0)
+                        input_tokens += usage.get("cache_read_input_tokens", 0)
+                        input_tokens += usage.get("cache_creation_input_tokens", 0)
+                    elif t == "message_delta":
+                        output_tokens += evt.get("usage", {}).get("output_tokens", 0)
+            except Exception:
+                pass
+    finally:
+        _update_counter(model_key, input_tokens, output_tokens)
+
+
+async def _count_stream_openai(gen, model_key: str):
+    """Wrap OpenAI SSE stream; count tokens from usage field (requires stream_options)."""
+    input_tokens = output_tokens = 0
+    try:
+        async for chunk in gen:
+            yield chunk
+            try:
+                for line in chunk.decode("utf-8", errors="replace").split("\n"):
+                    if not line.startswith("data: "):
+                        continue
+                    raw = line[6:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    usage = json.loads(raw).get("usage") or {}
+                    input_tokens  += usage.get("prompt_tokens", 0)
+                    output_tokens += usage.get("completion_tokens", 0)
+            except Exception:
+                pass
+    finally:
+        _update_counter(model_key, input_tokens, output_tokens)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  Anthropic passthrough (for real Claude models — sonnet/opus etc.)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -540,7 +637,7 @@ async def proxy_to_anthropic(request: Request, raw_body: bytes, stream: bool):
 
     if stream:
         return StreamingResponse(
-            _forward_stream_raw(target, headers, raw_body),
+            _count_stream_anthropic(_forward_stream_raw(target, headers, raw_body), model),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
@@ -548,7 +645,17 @@ async def proxy_to_anthropic(request: Request, raw_body: bytes, stream: bool):
     try:
         resp = await http_client.post(target, headers=headers, content=raw_body)
         logger.info(f"  Anthropic {resp.status_code} ({len(resp.content)}B)")
-        return JSONResponse(resp.json(), status_code=resp.status_code)
+        result = resp.json()
+        if resp.status_code == 200:
+            usage = result.get("usage", {})
+            _update_counter(
+                model,
+                usage.get("input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0),
+                usage.get("output_tokens", 0),
+            )
+        return JSONResponse(result, status_code=resp.status_code)
     except Exception as e:
         logger.error(f"  Anthropic ERROR: {e}")
         return JSONResponse(
@@ -651,20 +758,25 @@ async def proxy_messages(request: Request):
     }
 
     logger.info(f"    -> {target} (stream={stream})")
+    mkey = _minimax_key(model)
 
     if stream:
         return StreamingResponse(
-            _forward_stream(target, headers, body),
+            _count_stream_anthropic(_forward_stream(target, headers, body), mkey),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
 
     try:
         resp = await http_client.post(target, headers=headers, json=body)
+        result = resp.json()
         logger.info(f"  MiniMax {resp.status_code} ({len(resp.content)}B)")
         if resp.status_code != 200:
             logger.error(f"  MiniMax error body: {resp.text[:300]}")
-        return JSONResponse(resp.json(), status_code=resp.status_code)
+        else:
+            usage = result.get("usage", {})
+            _update_counter(mkey, usage.get("input_tokens", 0), usage.get("output_tokens", 0))
+        return JSONResponse(result, status_code=resp.status_code)
     except httpx.HTTPStatusError as e:
         logger.error(f"  MiniMax {e.response.status_code}: {e.response.text[:200]}")
         return JSONResponse(e.response.json(), status_code=e.response.status_code)
@@ -681,6 +793,7 @@ async def proxy_messages(request: Request):
 @app.post("/chat/completions")
 async def chat_completions(request: Request):
     body = await request.json()
+    original_model = body.get("model", "")
     messages = body.get("messages", [])
     images = has_images_openai(messages)
     stream = body.get("stream", False)
@@ -689,7 +802,7 @@ async def chat_completions(request: Request):
     tools = body.get("tools", [])
     tool_names = ", ".join(t.get("function", {}).get("name", "?") for t in tools[:5]) if tools else "-"
     logger.info(
-        f"\n[{ts}] [OpenAI] {body.get('model','?')} | msgs={len(messages)} img={'Y' if images else 'N'} "
+        f"\n[{ts}] [OpenAI] {original_model} | msgs={len(messages)} img={'Y' if images else 'N'} "
         f"stream={'Y' if stream else 'N'} tools={tool_names}"
     )
 
@@ -700,11 +813,13 @@ async def chat_completions(request: Request):
             return _quota_error_openai(stream)
         body["messages"] = messages
 
+    mkey = _minimax_key(original_model)
     body = {**body, "model": MINIMAX_MODEL, "stream": stream}
 
     if stream:
+        body["stream_options"] = {"include_usage": True}
         return StreamingResponse(
-            _stream_openai(body),
+            _count_stream_openai(_stream_openai(body), mkey),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache"},
         )
@@ -718,6 +833,8 @@ async def chat_completions(request: Request):
         logger.info(f"  MiniMax {resp.status_code} ({len(resp.content)}B)")
         resp.raise_for_status()
         result = resp.json()
+        usage = result.get("usage", {})
+        _update_counter(mkey, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
         choice = result.get("choices", [{}])[0]
         msg = choice.get("message", {})
         reply = msg.get("content", "") or ""
